@@ -48,13 +48,30 @@ def find_soffice() -> str | None:
     return shutil.which("soffice")
 
 
+def read_version(soffice: str) -> str:
+    """Read the version from program/version.ini.
+
+    Never shell out to `soffice --version`: on Windows that opens a console
+    that waits on "Press Enter to continue" and never exits, so the call
+    hangs until it is killed.
+    """
+    ini = Path(soffice).parent / "version.ini"
+    if ini.exists():
+        for line in ini.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.lower().startswith(("productversion", "buildid")):
+                return line.split("=", 1)[-1].strip()
+    return "version not reported"
+
+
 def make_real_doc(soffice: str, source_docx: Path, out_dir: Path) -> Path:
     """Convert .docx -> genuine Word 97-2003 .doc using LibreOffice."""
     out_dir.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
-        [soffice, "--headless", "--convert-to", "doc:MS Word 97",
+        [soffice, "--headless", "--norestore", "--invisible",
+         "--convert-to", "doc:MS Word 97",
          "--outdir", str(out_dir), str(source_docx)],
         capture_output=True, text=True, timeout=300,
+        stdin=subprocess.DEVNULL,
     )
     produced = out_dir / (source_docx.stem + ".doc")
     if not produced.exists():
@@ -76,10 +93,7 @@ def main() -> int:
         print("\n.DOC SUPPORT: NOT VERIFIED")
         return 1
 
-    version = subprocess.run(
-        [soffice, "--version"], capture_output=True, text=True, timeout=120
-    ).stdout.strip() or "version not reported"
-    record("LibreOffice present", True, f"{soffice} ({version})")
+    record("LibreOffice present", True, f"{soffice} ({read_version(soffice)})")
 
     source_docx = settings.documents_dir / "project_notes.docx"
     if not source_docx.exists():

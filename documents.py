@@ -246,11 +246,18 @@ def _convert_doc_to_docx(path: Path) -> Path:
         soffice = found
 
     tmpdir = Path(tempfile.mkdtemp(prefix="evidenceai_doc_"))
+    # An isolated user profile lets conversion work even while the user has
+    # LibreOffice open; without it the second instance refuses to start.
+    # stdin is closed because soffice waits on console input when attached.
+    profile = (tmpdir / "profile").as_uri()
     proc = subprocess.run(
-        [soffice, "--headless", "--convert-to", "docx", "--outdir", str(tmpdir), str(path)],
+        [soffice, "--headless", "--norestore", "--invisible",
+         f"-env:UserInstallation={profile}",
+         "--convert-to", "docx", "--outdir", str(tmpdir), str(path)],
         capture_output=True,
         text=True,
         timeout=180,
+        stdin=subprocess.DEVNULL,
     )
     converted = tmpdir / (path.stem + ".docx")
     if not converted.exists():
