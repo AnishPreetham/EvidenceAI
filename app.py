@@ -171,7 +171,12 @@ def main() -> None:
 
     # ---------------------------------------------------------------- ingest
     with tab_ingest:
-        st.subheader("Add files to the index")
+        st.subheader("Add sources to the index")
+        st.caption(
+            "Upload each source **once**. It is processed into indexed items "
+            "that persist across restarts, so you can then ask any number of "
+            "questions in the **Ask** tab without uploading it again."
+        )
         uploads = st.file_uploader(
             "PDF, DOC, DOCX, TXT, CSV, PNG, JPG, WEBP, WAV, MP3, M4A",
             type=["pdf", "doc", "docx", "txt", "csv", "png", "jpg", "jpeg",
@@ -200,30 +205,69 @@ def main() -> None:
 
     # ----------------------------------------------------------------- query
     with tab_query:
+        stats = pipeline.store.stats()
+        if stats["items"] == 0:
+            st.warning(
+                "Nothing is indexed yet. Add sources in the **Ingest** tab first — "
+                "you only need to do that once, then you can ask as many "
+                "questions as you like."
+            )
+
+        st.caption(
+            f"Searching {stats['items']} indexed items from "
+            f"{stats['sources']} source(s). Ingested sources stay indexed — "
+            "you never need to upload them again to ask about them."
+        )
+
         mode = st.radio(
-            "Query type",
+            "How do you want to ask?",
             ["Text", "Image", "Audio", "Document"],
             horizontal=True,
+            captions=[
+                "Type a question",
+                "Query by example image",
+                "Query by example audio",
+                "Query by example document",
+            ],
+            help="Text searches everything already indexed. The other three let "
+                 "you use a NEW file as the query itself — for finding indexed "
+                 "material related to it. They do not re-ingest anything.",
         )
         modality = QueryModality[mode.upper()]
 
         query_file = None
-        if modality is not QueryModality.TEXT:
+        if modality is QueryModality.TEXT:
+            st.caption(
+                "Asks your question against the whole indexed corpus — "
+                "documents, images and audio together. No upload needed."
+            )
+        else:
             extensions = {
                 QueryModality.IMAGE: ["png", "jpg", "jpeg", "webp"],
                 QueryModality.AUDIO: ["wav", "mp3", "m4a"],
                 QueryModality.DOCUMENT: ["pdf", "docx", "txt", "csv"],
             }[modality]
+            st.caption(
+                f"Optional. Upload a **new** {mode.lower()} to use as the query "
+                f"itself and find indexed material related to it. This file is "
+                f"not added to the index. To add sources, use the Ingest tab."
+            )
             query_file = st.file_uploader(
                 f"{mode} to query with", type=extensions, key=f"q_{mode}"
             )
 
-        default_question = (
-            "What evidence do we have about Project Alpha's 2024 development?"
+        placeholder = (
+            "e.g. What were the main findings across the reports?"
             if modality is QueryModality.TEXT
+            else f"Optional — leave blank to just find related material."
+        )
+        default_question = (
+            "" if modality is QueryModality.TEXT
             else f"Find evidence related to this {mode.lower()}."
         )
-        question = st.text_area("Question", value=default_question, height=80)
+        question = st.text_area(
+            "Question", value=default_question, height=80, placeholder=placeholder,
+        )
 
         col_a, col_b, col_c = st.columns(3)
         top_k = col_a.slider("Retrieve (top_k)", 1, 50, settings.top_k)
@@ -237,9 +281,17 @@ def main() -> None:
 
         if st.button("Search", type="primary"):
             temp_path = None
-            if modality is not QueryModality.TEXT:
+            if modality is QueryModality.TEXT:
+                if not question.strip():
+                    st.error("Type a question to search the indexed corpus.")
+                    st.stop()
+            else:
                 if query_file is None:
-                    st.error(f"Upload {mode.lower()} to run this query type.")
+                    st.error(
+                        f"Select a {mode.lower()} file to query with, or switch "
+                        f"to **Text** to ask a question about what is already "
+                        f"indexed."
+                    )
                     st.stop()
                 suffix = Path(query_file.name).suffix
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
@@ -247,7 +299,7 @@ def main() -> None:
                     temp_path = handle.name
 
             request = QueryRequest(
-                query=question or default_question,
+                query=question.strip() or f"Find evidence related to this {mode.lower()}.",
                 top_k=top_k,
                 rerank_top_k=rerank_top_k,
                 inference_mode=(InferenceMode.LOCAL_VISION if use_vision

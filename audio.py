@@ -45,6 +45,13 @@ MIME_BY_EXTENSION = {
 # Segments shorter than this carry no retrievable meaning on their own.
 MIN_SEGMENT_CHARS = 15
 
+# Whisper will happily emit text for non-speech audio (music, noise, silence)
+# when its VAD lets a chunk through. Those segments come back with a high
+# no_speech_prob and/or a very poor avg_logprob. Dropping them is what stops
+# a song from being indexed as if it were a fabricated transcript.
+MAX_NO_SPEECH_PROB = 0.6
+MIN_AVG_LOGPROB = -1.0
+
 # Whisper emits one segment per breath group -- often 4-8 seconds and a
 # single clause. Indexed alone, those lose to longer document chunks in both
 # the bi-encoder and the cross-encoder purely because they carry less text.
@@ -94,7 +101,15 @@ def _validate(path_str: str) -> Path:
 
 
 def transcribe(path: Path) -> list[dict]:
-    """Return [{start, end, text}] for one audio file."""
+    """Return [{start, end, text}] for one audio file.
+
+    Decoding is delegated to faster-whisper, which reads WAV/MP3/M4A/FLAC/OGG
+    through PyAV and resamples to the 16 kHz mono the model expects. Sample
+    rate and channel count therefore need no handling here.
+
+    Segments Whisper is not confident are speech are discarded rather than
+    indexed: see MAX_NO_SPEECH_PROB.
+    """
     model = _get_model()
     try:
         segments, _info = model.transcribe(
@@ -102,11 +117,32 @@ def transcribe(path: Path) -> list[dict]:
             beam_size=5,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
+            # Without this, a non-speech stretch makes Whisper loop on its own
+            # previous output ("thank you. thank you. thank you.").
+            condition_on_previous_text=False,
         )
-        return [
-            {"start": float(s.start), "end": float(s.end), "text": s.text.strip()}
-            for s in segments
-        ]
+        kept: list[dict] = []
+        for segment in segments:
+            text = segment.text.strip()
+            if not text:
+                continue
+            no_speech = float(getattr(segment, "no_speech_prob", 0.0) or 0.0)
+            avg_logprob = float(getattr(segment, "avg_logprob", 0.0) or 0.0)
+            if no_speech > MAX_NO_SPEECH_PROB or avg_logprob < MIN_AVG_LOGPROB:
+                logger.info(
+                    "Dropping low-confidence segment [%.1f-%.1f] "
+                    "no_speech_prob=%.2f avg_logprob=%.2f",
+                    segment.start, segment.end, no_speech, avg_logprob,
+                )
+                continue
+            kept.append({
+                "start": float(segment.start),
+                "end": float(segment.end),
+                "text": text,
+                "no_speech_prob": no_speech,
+                "avg_logprob": avg_logprob,
+            })
+        return kept
     except Exception as exc:
         raise RuntimeError(f"{ErrorCode.TRANSCRIPTION_FAILED.value}: {exc}") from exc
 
@@ -175,11 +211,25 @@ def process_audio(path_str: str) -> IngestionResult:
         segments = merge_segments(raw_segments)
         kept = [s for s in segments if len(s["text"]) >= MIN_SEGMENT_CHARS]
         if not kept:
+            # These are different problems and lead to different user actions,
+            # so they get different messages rather than one generic failure.
+            if not raw_segments:
+                detail = (
+                    "No speech was detected. The file appears to contain music, "
+                    "silence or noise rather than spoken words. Ingest a "
+                    "recording of speech instead."
+                )
+            else:
+                detail = (
+                    f"Speech was detected but every passage was shorter than "
+                    f"{MIN_SEGMENT_CHARS} characters, which is too little to "
+                    f"retrieve on. Use a longer recording."
+                )
             return IngestionResult(
                 source=source,
                 items=[],
                 success=False,
-                error="No intelligible speech found in audio.",
+                error=detail,
                 error_code=ErrorCode.TRANSCRIPTION_FAILED,
                 warnings=warnings,
             )
