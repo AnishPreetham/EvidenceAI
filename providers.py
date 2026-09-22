@@ -259,9 +259,9 @@ class OpenAIProvider(InferenceProvider):
         return settings.online_model
 
     def readiness(self) -> Readiness:
-        """Credentials only. Deliberately does NOT probe Ollama, and does not
-        spend an API call to validate the key -- authentication problems are
-        reported when a request is actually made."""
+        """Probes GET /models to confirm auth actually works.
+        "Ready" means the endpoint accepted the key — not merely that a key
+        is configured."""
         if not settings.openai_api_key.strip():
             return Readiness(
                 False,
@@ -270,12 +270,49 @@ class OpenAIProvider(InferenceProvider):
                 f".env file (or your host's secret settings) and reload.",
                 ErrorCode.OLLAMA_NOT_AVAILABLE,
             )
-        return Readiness(
-            True,
-            f"Online AI ready — {settings.online_model}",
-            f"Endpoint {settings.online_base_url}; key loaded from "
-            f"{settings.online_api_key_env}.",
-        )
+        try:
+            req = urllib.request.Request(
+                f"{settings.online_base_url.rstrip('/')}/models",
+                headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                resp.read()
+            return Readiness(
+                True,
+                f"Online AI ready — {settings.online_model}",
+                f"Endpoint {settings.online_base_url}; key loaded from "
+                f"{settings.online_api_key_env}.",
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return Readiness(
+                    False,
+                    "Online AI could not authenticate — API key rejected.",
+                    f"HTTP {exc.code} on GET /models. Check "
+                    f"{settings.online_api_key_env} in your .env file.",
+                    ErrorCode.OLLAMA_NOT_AVAILABLE,
+                )
+            return Readiness(
+                False,
+                "Online AI is temporarily unavailable.",
+                f"HTTP {exc.code} on GET /models.",
+                ErrorCode.OLLAMA_NOT_AVAILABLE,
+            )
+        except urllib.error.URLError as exc:
+            return Readiness(
+                False,
+                "Online AI is unreachable — check your internet connection.",
+                _redact(f"URLError on GET /models: {exc.reason}"),
+                ErrorCode.OLLAMA_NOT_AVAILABLE,
+            )
+        except Exception as exc:
+            return Readiness(
+                False,
+                "Online AI is unavailable.",
+                _redact(f"{type(exc).__name__}: {exc}"),
+                ErrorCode.OLLAMA_NOT_AVAILABLE,
+            )
 
     def _build_messages(
         self,
@@ -500,19 +537,18 @@ class AutoProvider(InferenceProvider):
                     query, evidence, filenames, inspect_image
                 )
             except ProviderError as exc:
-                if exc.is_transient:
-                    # Connectivity failure: re-check, try offline if ready.
-                    self._invalidate_online_cache()
-                    offline_r = self._offline.readiness()
-                    if offline_r.ready:
-                        logger.info(
-                            "AUTO: online failed (%s), falling back to offline",
-                            exc.technical[:120],
-                        )
-                        return self._offline.generate(
-                            query, evidence, filenames, inspect_image
-                        )
-                # Auth/quota/config error, or offline also unavailable.
+                # Any online failure in AUTO mode: invalidate cache, try offline.
+                self._invalidate_online_cache()
+                offline_r = self._offline.readiness()
+                if offline_r.ready:
+                    logger.info(
+                        "AUTO: online failed (%s), falling back to offline",
+                        exc.technical[:120],
+                    )
+                    return self._offline.generate(
+                        query, evidence, filenames, inspect_image
+                    )
+                # Offline also not ready: propagate the online error.
                 raise
 
         offline_r = self._offline.readiness()
