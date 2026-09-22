@@ -31,16 +31,101 @@ def load_pipeline():
     return get_pipeline()
 
 
-def render_health(pipeline) -> None:
-    health = pipeline.health()
+def select_backend() -> "object":
+    """Inference-mode selector. Returns the chosen Backend."""
+    from providers import Backend
+
+    with st.sidebar:
+        st.subheader("Inference mode")
+        choice = st.radio(
+            "Where should the AI run?",
+            ["Offline", "Online"],
+            index=0 if settings.inference_backend == "offline" else 1,
+            captions=[
+                "Local AI on this machine",
+                "Cloud AI over the internet",
+            ],
+            key="backend_choice",
+            label_visibility="collapsed",
+        )
+    return Backend.OFFLINE if choice == "Offline" else Backend.ONLINE
+
+
+def render_backend_status(pipeline, backend) -> bool:
+    """Show readiness for the selected backend and offer recovery actions.
+
+    Returns True when the backend can serve a query. Never raises, and never
+    silently switches backend -- the user's choice is always respected.
+    """
+    from providers import Backend, ollama_installed, start_ollama
+
+    info = pipeline.health(backend)["inference"]
+
+    with st.sidebar:
+        if info["ready"]:
+            st.success(f"✓ {info['message']}")
+        else:
+            st.warning(f"⚠ {info['message']}")
+
+        if not info["ready"]:
+            if backend is Backend.ONLINE:
+                st.caption(
+                    f"Add your cloud API key as `{settings.online_api_key_env}` "
+                    "to the local `.env` file, then reload the page."
+                )
+                st.code(f"{settings.online_api_key_env}=your_api_key_here",
+                        language="bash")
+                if st.button("Check again", key="recheck_online"):
+                    st.cache_resource.clear()
+                    st.rerun()
+            else:
+                st.caption(
+                    "Evidence AI uses local AI for Offline mode. "
+                    "It runs on this machine, so nothing leaves your computer."
+                )
+                installed = ollama_installed()
+                if not installed:
+                    st.caption("Offline AI requires Ollama to run AI locally.")
+                    st.link_button("Install Ollama", "https://ollama.com/download")
+                else:
+                    if st.button("Start Offline AI", key="start_ollama"):
+                        with st.spinner("Starting local AI service..."):
+                            started, detail = start_ollama()
+                        if started:
+                            st.cache_resource.clear()
+                            st.rerun()
+                        else:
+                            st.error("Could not start Offline AI automatically.")
+                            with st.expander("Technical details"):
+                                st.code(detail)
+                    if info.get("code") != "OLLAMA_NOT_AVAILABLE":
+                        st.caption(
+                            f"Required local model: `{settings.ollama_model}`"
+                        )
+                        st.code(f"ollama pull {settings.ollama_model}",
+                                language="bash")
+
+                cols = st.columns(2)
+                if cols[0].button("Check again", key="recheck_offline"):
+                    st.cache_resource.clear()
+                    st.rerun()
+                if cols[1].button("Use Online", key="switch_online"):
+                    st.session_state["backend_choice"] = "Online"
+                    st.rerun()
+
+            if info["technical"]:
+                with st.expander("Technical details"):
+                    st.code(info["technical"])
+
+    return bool(info["ready"])
+
+
+def render_health(pipeline, backend) -> None:
+    health = pipeline.health(backend)
     index = health["index"]
 
     with st.sidebar:
         st.subheader("Runtime")
-        ollama_ok = health["ollama"]["available"]
-        st.write(("🟢" if ollama_ok else "🔴") + f" Ollama — {settings.ollama_model}")
-        if not ollama_ok:
-            st.caption(health["ollama"]["detail"])
         st.write(("🟢" if health["tesseract"]["available"] else "🔴") + " Tesseract OCR")
         st.write(("🟢" if health["libreoffice"]["available"] else "⚪")
                  + " LibreOffice (.doc)")
@@ -54,9 +139,14 @@ def render_health(pipeline) -> None:
         if index["by_modality"]:
             st.caption(" · ".join(f"{k}: {v}" for k, v in index["by_modality"].items()))
 
-        st.subheader("Models (all local)")
+        st.subheader("Models")
         for label, value in health["models"].items():
             st.caption(f"{label}: `{value}`")
+        st.caption(
+            "Ingestion (OCR, image understanding, transcription, embeddings, "
+            "retrieval) always runs locally. Only answer generation uses the "
+            "cloud in Online mode."
+        )
 
 
 def render_evidence(pipeline, response) -> None:
@@ -156,14 +246,26 @@ def render_response(pipeline, response) -> None:
 
 
 def main() -> None:
+    from providers import Backend
+
     st.title("🔍 Evidence AI")
     st.caption(
-        "Offline-runtime multimodal RAG — documents, images and audio. "
-        "All inference is local."
+        "Multimodal RAG over documents, images and audio — with grounded "
+        "answers, citations and abstention."
     )
 
+    backend = select_backend()
     pipeline = load_pipeline()
-    render_health(pipeline)
+    backend_ready = render_backend_status(pipeline, backend)
+    render_health(pipeline, backend)
+
+    if backend is Backend.OFFLINE:
+        st.caption("🔒 Offline mode — every stage runs on this machine.")
+    else:
+        st.caption(
+            "☁️ Online mode — retrieval stays local; retrieved evidence is "
+            "sent to the cloud model to write the answer."
+        )
 
     tab_query, tab_ingest, tab_sources = st.tabs(
         ["Ask", "Ingest", "Sources"]
@@ -279,7 +381,7 @@ def main() -> None:
                  "(~1030 extra context tokens).",
         )
 
-        if st.button("Search", type="primary"):
+        if st.button("Search", type="primary", disabled=not backend_ready):
             temp_path = None
             if modality is QueryModality.TEXT:
                 if not question.strip():
@@ -307,10 +409,17 @@ def main() -> None:
                 query_modality=modality,
                 query_file_path=temp_path,
             )
+            from rag_pipeline import last_technical_detail
+
             with st.spinner("Retrieving, reranking, generating..."):
-                response = pipeline.query(request)
+                response = pipeline.query(request, backend=backend)
+            technical = last_technical_detail()
             if temp_path:
                 Path(temp_path).unlink(missing_ok=True)
+
+            if technical:
+                with st.expander("Technical details"):
+                    st.code(technical)
 
             if response.query_representation and modality is not QueryModality.TEXT:
                 with st.expander("Query representation used for retrieval"):

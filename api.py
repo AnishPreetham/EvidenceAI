@@ -20,7 +20,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-
+from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from rag_pipeline import get_pipeline
 from schemas import (
@@ -40,13 +40,29 @@ app = FastAPI(
     version="1.0.0",
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    # Local dev frontend, plus your deployed Vercel URL once you have one.
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health")
-def health() -> dict:
-    """Runtime status. Never raises -- it is the endpoint you call when
-    something else is broken."""
+def health(backend: str | None = None) -> dict:
+    """Runtime status for the selected inference backend.
+
+    `backend` is "offline" (local Ollama) or "online" (cloud API); it
+    defaults to settings.inference_backend. Online mode is not probed
+    against Ollama, so this endpoint works on a host with no Ollama.
+    """
     try:
-        return get_pipeline().health()
+        return get_pipeline().health(backend)
     except Exception as exc:
         logger.exception("Health check failed")
         return {"status": "error", "detail": str(exc)}
@@ -100,10 +116,25 @@ async def ingest(files: list[UploadFile] = File(...)) -> dict:
     }
 
 
-@app.post("/query", response_model=QueryResponse)
-def query(request: QueryRequest) -> QueryResponse:
-    """Text query against the index."""
-    return get_pipeline().query(request)
+@app.post("/query")
+def query(request: QueryRequest, backend: str | None = None) -> dict:
+    """Text query against the index.
+
+    `backend` ("offline" | "online") selects the inference provider and
+    defaults to settings.inference_backend. It is a query parameter rather
+    than a QueryRequest field so the locked schemas.py contract is unchanged.
+
+    The response is the QueryResponse contract plus a sibling
+    `technical_detail` string, which carries provider error detail for a
+    "Technical details" view without altering QueryResponse itself.
+    """
+    from rag_pipeline import last_technical_detail
+
+    response = get_pipeline().query(request, backend=backend)
+    return {
+        **response.model_dump(mode="json"),
+        "technical_detail": last_technical_detail(),
+    }
 
 
 @app.post("/query_file", response_model=QueryResponse)
@@ -114,8 +145,12 @@ async def query_file(
     inference_mode: InferenceMode = Form(InferenceMode.LOCAL),
     top_k: int = Form(settings.top_k),
     rerank_top_k: int = Form(settings.rerank_top_k),
+    backend: str | None = Form(None),
 ) -> QueryResponse:
-    """Query using an uploaded image, audio clip, or document as the query."""
+    """Query using an uploaded image, audio clip, or document as the query.
+
+    `backend` ("offline" | "online") selects the inference provider.
+    """
     suffix = Path(file.filename or "query").suffix or ".bin"
     data = await file.read()
 
@@ -131,7 +166,7 @@ async def query_file(
             inference_mode=inference_mode,
             query_modality=query_modality,
             query_file_path=temp_path,
-        ))
+        ), backend=backend)
     finally:
         Path(temp_path).unlink(missing_ok=True)
 

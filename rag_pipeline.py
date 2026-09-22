@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -61,6 +62,22 @@ def _safe_name(filename: str) -> str:
     return Path(filename).name.replace("\\", "_").replace("/", "_")
 
 
+# Technical error detail for the most recent query on this thread. Kept
+# outside QueryResponse so that schemas.py stays unchanged, and thread-local
+# so concurrent API requests cannot read each other's detail. The UI renders
+# it behind a "Technical details" expander; it is never the headline.
+_local = threading.local()
+
+
+def _set_technical_detail(detail: str) -> None:
+    _local.technical_detail = detail
+
+
+def last_technical_detail() -> str:
+    """Technical detail from the last query on this thread, or ''."""
+    return getattr(_local, "technical_detail", "")
+
+
 class RAGPipeline:
     """Owns the store and the stateless stages. Models load lazily on first
     use and are then reused for the life of the process."""
@@ -76,16 +93,34 @@ class RAGPipeline:
 
     # ---------------------------------------------------------------- health
 
-    def health(self) -> dict:
-        from llm import ollama_available
+    def health(self, backend=None) -> dict:
+        """Readiness for the selected backend.
 
-        ollama_ok, ollama_detail = ollama_available()
+        Only the selected backend is probed. In online mode this never
+        contacts Ollama, so the application is fully usable on a machine
+        where Ollama is not installed.
+        """
+        from providers import Backend, get_provider, resolve_backend
+
+        resolved = resolve_backend(backend)
+        provider = get_provider(resolved)
+        readiness = provider.readiness()
+
         tesseract_ok = Path(settings.tesseract_cmd).exists() or bool(
             shutil.which("tesseract")
         )
-        return {
-            "status": "ok" if ollama_ok else "degraded",
-            "ollama": {"available": ollama_ok, "detail": ollama_detail},
+        health = {
+            "status": "ok" if readiness.ready else "degraded",
+            "backend": resolved.value,
+            "inference": {
+                "backend": resolved.value,
+                "label": provider.label,
+                "model": provider.model_name,
+                "ready": readiness.ready,
+                "message": readiness.message,
+                "technical": readiness.technical,
+                "can_autostart": readiness.can_autostart,
+            },
             "tesseract": {
                 "available": tesseract_ok,
                 "detail": settings.tesseract_cmd if tesseract_ok
@@ -93,13 +128,26 @@ class RAGPipeline:
             },
             "libreoffice": {"available": Path(settings.soffice_cmd).exists()},
             "models": {
-                "llm": settings.ollama_model,
+                "llm": provider.model_name,
                 "embedding": settings.embedding_model,
                 "reranker": settings.reranker_model,
                 "whisper": settings.whisper_model_size,
             },
             "index": self.store.stats(),
         }
+        # Preserved for existing callers and tests that read health["ollama"].
+        # Populated without a probe when online, so online stays Ollama-free.
+        if resolved is Backend.OFFLINE:
+            health["ollama"] = {
+                "available": readiness.ready,
+                "detail": readiness.technical or readiness.message,
+            }
+        else:
+            health["ollama"] = {
+                "available": False,
+                "detail": "Not required in online mode; not checked.",
+            }
+        return health
 
     # ------------------------------------------------------------- ingestion
 
@@ -238,11 +286,25 @@ class RAGPipeline:
 
     # ------------------------------------------------------------------ query
 
-    def query(self, request: QueryRequest) -> QueryResponse:
+    def query(self, request: QueryRequest, backend=None) -> QueryResponse:
+        """Run the shared RAG pipeline and generate with the selected backend.
+
+        `backend` selects offline (local Ollama) or online (cloud API). It is
+        a keyword argument rather than a QueryRequest field so that the
+        locked schemas.py contract is unchanged; it defaults to
+        settings.inference_backend.
+
+        Everything before generation -- retrieval, reranking, relationship
+        expansion, the abstention gate -- is identical on both backends.
+        """
         from citations import build_citations
-        from llm import OllamaError, generate_answer, pick_inspectable_image
+        from llm import pick_inspectable_image
+        from providers import ProviderError, get_provider, supports_vision
         from relationships import compute_related_to, expand_evidence
         from reranker import score_to_confidence
+
+        provider = get_provider(backend)
+        _set_technical_detail("")  # never leak detail from a previous query
 
         timings: dict[str, float] = {}
         started = time.perf_counter()
@@ -329,16 +391,21 @@ class RAGPipeline:
         mark = time.perf_counter()
         inspect_image = (
             pick_inspectable_image(final_evidence)
-            if request.inference_mode is InferenceMode.LOCAL_VISION
+            if (request.inference_mode is InferenceMode.LOCAL_VISION
+                and supports_vision(backend))
             else None
         )
         try:
-            answer = generate_answer(
+            answer = provider.generate(
                 representation, final_evidence, filenames, inspect_image=inspect_image
             )
-        except OllamaError as exc:
+        except ProviderError as exc:
+            # The headline stays user-facing. The raw detail travels through
+            # last_technical_detail() rather than QueryResponse, so the
+            # locked schemas.py contract needs no new field.
+            _set_technical_detail(exc.technical)
             return QueryResponse(
-                answer=f"Local generation unavailable: {exc}",
+                answer=exc.user_message,
                 retrieved_items=reranked,
                 relationships=relationships,
                 abstained=True,

@@ -25,6 +25,29 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
+def _bridge_streamlit_secrets() -> None:
+    """Copy Streamlit Cloud secrets into the environment.
+
+    Hosted Streamlit supplies secrets through `st.secrets`, which
+    pydantic-settings does not read. Bridging them here means the same
+    Settings class works locally (.env) and hosted (platform secrets) with
+    no code change. Existing environment variables always win, and nothing
+    is logged -- only key names are ever touched.
+    """
+    try:
+        import streamlit as st
+
+        for name, value in st.secrets.items():
+            if isinstance(value, str) and name not in os.environ:
+                os.environ[name] = value
+    except Exception:
+        # Not running under Streamlit, or no secrets configured. Both fine.
+        pass
+
+
+_bridge_streamlit_secrets()
+
+
 class Settings(BaseSettings):
     """Runtime configuration. Every field is overridable from .env."""
 
@@ -33,6 +56,23 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # ---- Inference backend ---------------------------------------------
+    # "offline" -> local Ollama;  "online" -> cloud API.
+    # This is the backend the UI starts on; the user can switch at runtime.
+    inference_backend: str = "offline"
+
+    # ---- Online (cloud) inference ---------------------------------------
+    # Read from the environment / .env only. Never hard-code a key here.
+    openai_api_key: str = ""
+    online_model: str = "gpt-4o-mini"
+    # Any OpenAI-compatible endpoint works (Azure OpenAI, OpenRouter, a
+    # self-hosted gateway) without touching provider code.
+    online_base_url: str = "https://api.openai.com/v1"
+    online_timeout: int = 120
+    online_model_supports_vision: bool = True
+    # Named in user-facing setup messages so they know exactly what to set.
+    online_api_key_env: str = "OPENAI_API_KEY"
 
     # ---- Local LLM (Ollama) ------------------------------------------
     ollama_host: str = "http://localhost:11434"

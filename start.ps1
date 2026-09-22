@@ -29,30 +29,51 @@ if (-not (Test-Path $py)) {
 
 Say "Preflight"
 
-# Ollama daemon
+# Offline AI (Ollama). This is checked but NEVER fatal: Online mode does not
+# need Ollama, and the app reports offline readiness in its own UI with a
+# Check Again / Install / Switch to Online flow.
+$ollamaReady = $false
 try {
     $null = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -TimeoutSec 5
+    $ollamaReady = $true
     Good "Ollama is running"
 } catch {
-    Warn "Ollama is not responding - starting it..."
-    Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden
-    Start-Sleep -Seconds 5
-    try {
-        $null = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -TimeoutSec 5
-        Good "Ollama started"
-    } catch {
-        Bad "Could not start Ollama. Run 'ollama serve' in another terminal."
-        exit 1
+    if (Get-Command ollama -ErrorAction SilentlyContinue) {
+        Warn "Ollama is not responding - starting it..."
+        Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden
+        Start-Sleep -Seconds 5
+        try {
+            $null = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -TimeoutSec 5
+            $ollamaReady = $true
+            Good "Ollama started"
+        } catch {
+            Warn "Could not start Ollama. Offline mode will be unavailable."
+        }
+    } else {
+        Warn "Ollama is not installed. Offline mode will be unavailable."
     }
 }
 
-# Required model
-$tags = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -TimeoutSec 5
-if ($tags.models.name -contains "qwen2.5vl:3b") {
-    Good "qwen2.5vl:3b available"
+if ($ollamaReady) {
+    $tags = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -TimeoutSec 5
+    if ($tags.models.name -contains "qwen2.5vl:3b") {
+        Good "Offline AI ready - qwen2.5vl:3b"
+    } else {
+        Warn "qwen2.5vl:3b not installed. Run: ollama pull qwen2.5vl:3b"
+        $ollamaReady = $false
+    }
+}
+
+# Online AI credentials. Presence only - the key itself is never printed.
+if ($env:OPENAI_API_KEY -or (Test-Path (Join-Path $root ".env"))) {
+    Good "Online AI credentials source present (.env or environment)"
 } else {
-    Bad "qwen2.5vl:3b missing. Run: ollama pull qwen2.5vl:3b"
-    exit 1
+    Warn "No OPENAI_API_KEY found. Online mode will need configuring in .env."
+}
+
+if (-not $ollamaReady) {
+    Warn "Offline AI is not ready. The app will still start - select Online"
+    Warn "in the sidebar, or use the setup buttons shown in the UI."
 }
 
 # Tesseract
