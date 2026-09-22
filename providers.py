@@ -55,6 +55,7 @@ class Backend(str, Enum):
     """Which inference provider serves generation."""
     OFFLINE = "offline"
     ONLINE = "online"
+    AUTO = "auto"
 
 
 @dataclass(frozen=True)
@@ -76,11 +77,21 @@ class Readiness:
 class ProviderError(RuntimeError):
     """Generation failed. Carries a user-safe message plus technical detail."""
 
-    def __init__(self, user_message: str, technical: str, code: ErrorCode):
+    def __init__(
+        self,
+        user_message: str,
+        technical: str,
+        code: ErrorCode,
+        is_transient: bool = False,
+    ):
         super().__init__(user_message)
         self.user_message = user_message
         self.technical = technical
         self.code = code
+        # True for connectivity/service failures where a fallback makes sense.
+        # False for configuration problems (bad key, wrong model, quota) where
+        # switching providers does not help.
+        self.is_transient = is_transient
 
 
 def _redact(text: str) -> str:
@@ -361,12 +372,14 @@ class OpenAIProvider(InferenceProvider):
                 "internet connection or the API service.",
                 _redact(f"{type(exc).__name__}: {exc.reason}"),
                 ErrorCode.OLLAMA_NOT_AVAILABLE,
+                is_transient=True,
             ) from exc
         except Exception as exc:
             raise ProviderError(
                 "Online AI is currently unavailable.",
                 _redact(f"{type(exc).__name__}: {exc}"),
                 ErrorCode.OLLAMA_NOT_AVAILABLE,
+                is_transient=True,
             ) from exc
 
         try:
@@ -388,6 +401,145 @@ class OpenAIProvider(InferenceProvider):
 
 
 # ---------------------------------------------------------------------------
+# AUTO -- selects Online when available, falls back to Offline
+# ---------------------------------------------------------------------------
+
+class AutoProvider(InferenceProvider):
+    """Automatically routes to Online when it can serve a request; falls back
+    to Offline otherwise. Neither the UI nor the user needs to choose.
+
+    Online readiness is cached for _CACHE_TTL seconds so every request does
+    not pay a probe round-trip. The cache is invalidated immediately whenever
+    a real generation call fails with a transient error, so the next request
+    re-checks rather than trusting a stale "ready" result.
+    """
+
+    backend = Backend.AUTO
+    label = "Auto"
+
+    _CACHE_TTL: float = 30.0
+    # Class-level cache shared across all instances (singleton in _PROVIDERS).
+    _online_ready: "Readiness | None" = None
+    _online_ready_at: float = 0.0
+
+    def __init__(self) -> None:
+        self._online = OpenAIProvider()
+        self._offline = OllamaProvider()
+
+    @property
+    def model_name(self) -> str:
+        r = self._cached_online_readiness()
+        return self._online.model_name if r.ready else self._offline.model_name
+
+    # ---------------------------------------------------------------- cache
+
+    def _cached_online_readiness(self) -> Readiness:
+        import time
+        now = time.monotonic()
+        if (
+            AutoProvider._online_ready is None
+            or now - AutoProvider._online_ready_at >= AutoProvider._CACHE_TTL
+        ):
+            AutoProvider._online_ready = self._online.readiness()
+            AutoProvider._online_ready_at = now
+        return AutoProvider._online_ready  # type: ignore[return-value]
+
+    def _invalidate_online_cache(self) -> None:
+        AutoProvider._online_ready = None
+        AutoProvider._online_ready_at = 0.0
+
+    # ------------------------------------------------------------ readiness
+
+    def readiness(self) -> Readiness:
+        online_r = self._cached_online_readiness()
+        offline_r = self._offline.readiness()
+
+        if online_r.ready:
+            return Readiness(
+                ready=True,
+                message=online_r.message,
+                technical=f"AUTO → online. {online_r.technical}",
+            )
+        if offline_r.ready:
+            return Readiness(
+                ready=True,
+                message=offline_r.message,
+                technical=(
+                    f"AUTO → offline (online unavailable: {online_r.technical}). "
+                    f"{offline_r.technical}"
+                ),
+            )
+        return Readiness(
+            ready=False,
+            message=(
+                "No AI provider is currently available.\n\n"
+                f"Online: {online_r.message}\n"
+                f"Offline: {offline_r.message}"
+            ),
+            technical=(
+                f"Online: {online_r.technical or online_r.message}. "
+                f"Offline: {offline_r.technical or offline_r.message}"
+            ),
+            code=ErrorCode.OLLAMA_NOT_AVAILABLE,
+        )
+
+    # ------------------------------------------------------------- generate
+
+    def generate(
+        self,
+        query: str,
+        evidence: list[RerankedResult],
+        filenames: dict[str, str],
+        inspect_image: Path | None = None,
+    ) -> str:
+        online_r = self._cached_online_readiness()
+
+        if online_r.ready:
+            try:
+                return self._online.generate(
+                    query, evidence, filenames, inspect_image
+                )
+            except ProviderError as exc:
+                if exc.is_transient:
+                    # Connectivity failure: re-check, try offline if ready.
+                    self._invalidate_online_cache()
+                    offline_r = self._offline.readiness()
+                    if offline_r.ready:
+                        logger.info(
+                            "AUTO: online failed (%s), falling back to offline",
+                            exc.technical[:120],
+                        )
+                        return self._offline.generate(
+                            query, evidence, filenames, inspect_image
+                        )
+                # Auth/quota/config error, or offline also unavailable.
+                raise
+
+        offline_r = self._offline.readiness()
+        if offline_r.ready:
+            return self._offline.generate(
+                query, evidence, filenames, inspect_image
+            )
+
+        # Both unavailable.
+        online_r2 = self._cached_online_readiness()
+        raise ProviderError(
+            (
+                "No AI provider is currently available.\n\n"
+                f"Online provider: {online_r2.message}\n\n"
+                f"Offline AI: {offline_r.message}\n\n"
+                "Configure the server-side Online provider (OPENAI_API_KEY in "
+                ".env) or install and start Ollama."
+            ),
+            (
+                f"Online: {online_r2.technical or online_r2.message}. "
+                f"Offline: {offline_r.technical or offline_r.message}"
+            ),
+            ErrorCode.OLLAMA_NOT_AVAILABLE,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
 
@@ -403,17 +555,20 @@ def resolve_backend(backend: Backend | str | None) -> Backend:
     try:
         return Backend(str(backend).strip().lower())
     except ValueError:
-        logger.warning("Unknown backend %r; using offline.", backend)
-        return Backend.OFFLINE
+        logger.warning("Unknown backend %r; using auto.", backend)
+        return Backend.AUTO
 
 
 def get_provider(backend: Backend | str | None = None) -> InferenceProvider:
     """Return the provider for a backend. Instances are cached and stateless."""
     resolved = resolve_backend(backend)
     if resolved not in _PROVIDERS:
-        _PROVIDERS[resolved] = (
-            OpenAIProvider() if resolved is Backend.ONLINE else OllamaProvider()
-        )
+        if resolved is Backend.ONLINE:
+            _PROVIDERS[resolved] = OpenAIProvider()
+        elif resolved is Backend.OFFLINE:
+            _PROVIDERS[resolved] = OllamaProvider()
+        else:
+            _PROVIDERS[resolved] = AutoProvider()
     return _PROVIDERS[resolved]
 
 

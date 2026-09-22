@@ -58,9 +58,10 @@ class Settings(BaseSettings):
     )
 
     # ---- Inference backend ---------------------------------------------
-    # "offline" -> local Ollama;  "online" -> cloud API.
-    # This is the backend the UI starts on; the user can switch at runtime.
-    inference_backend: str = "offline"
+    # "auto"    -> online when available, offline fallback (recommended)
+    # "offline" -> local Ollama only
+    # "online"  -> cloud API only
+    inference_backend: str = "auto"
 
     # ---- Online (cloud) inference ---------------------------------------
     # Read from the environment / .env only. Never hard-code a key here.

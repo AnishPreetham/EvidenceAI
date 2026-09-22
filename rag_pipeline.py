@@ -96,9 +96,10 @@ class RAGPipeline:
     def health(self, backend=None) -> dict:
         """Readiness for the selected backend.
 
-        Only the selected backend is probed. In online mode this never
-        contacts Ollama, so the application is fully usable on a machine
-        where Ollama is not installed.
+        For AUTO mode, both online and offline providers are checked so the
+        frontend can show per-provider status and setup guidance. For ONLINE
+        mode Ollama is never contacted, so the app works on a machine without
+        Ollama installed.
         """
         from providers import Backend, get_provider, resolve_backend
 
@@ -109,18 +110,52 @@ class RAGPipeline:
         tesseract_ok = Path(settings.tesseract_cmd).exists() or bool(
             shutil.which("tesseract")
         )
+        inference_info: dict = {
+            "backend": resolved.value,
+            "label": provider.label,
+            "model": provider.model_name,
+            "ready": readiness.ready,
+            "message": readiness.message,
+            "technical": readiness.technical,
+            "can_autostart": readiness.can_autostart,
+        }
+
+        # AUTO: add per-provider detail so the frontend can show setup guidance
+        # and the active provider without the user needing to interpret the
+        # consolidated message.
+        if resolved is Backend.AUTO:
+            online_r = get_provider(Backend.ONLINE).readiness()
+            offline_r = get_provider(Backend.OFFLINE).readiness()
+            active = (
+                "online" if online_r.ready
+                else "offline" if offline_r.ready
+                else None
+            )
+            inference_info.update({
+                "active_provider": active,
+                "fallback": (not online_r.ready and offline_r.ready),
+                "fallback_reason": (
+                    "ONLINE_PROVIDER_UNAVAILABLE" if not online_r.ready else None
+                ),
+                "online": {
+                    "ready": online_r.ready,
+                    "message": online_r.message,
+                    "model": get_provider(Backend.ONLINE).model_name,
+                    "code": online_r.code.value if online_r.code else None,
+                },
+                "offline": {
+                    "ready": offline_r.ready,
+                    "message": offline_r.message,
+                    "model": get_provider(Backend.OFFLINE).model_name,
+                    "code": offline_r.code.value if offline_r.code else None,
+                    "can_autostart": offline_r.can_autostart,
+                },
+            })
+
         health = {
             "status": "ok" if readiness.ready else "degraded",
             "backend": resolved.value,
-            "inference": {
-                "backend": resolved.value,
-                "label": provider.label,
-                "model": provider.model_name,
-                "ready": readiness.ready,
-                "message": readiness.message,
-                "technical": readiness.technical,
-                "can_autostart": readiness.can_autostart,
-            },
+            "inference": inference_info,
             "tesseract": {
                 "available": tesseract_ok,
                 "detail": settings.tesseract_cmd if tesseract_ok
@@ -136,11 +171,18 @@ class RAGPipeline:
             "index": self.store.stats(),
         }
         # Preserved for existing callers and tests that read health["ollama"].
-        # Populated without a probe when online, so online stays Ollama-free.
+        # AUTO and ONLINE modes do not probe Ollama; only OFFLINE does.
         if resolved is Backend.OFFLINE:
             health["ollama"] = {
                 "available": readiness.ready,
                 "detail": readiness.technical or readiness.message,
+            }
+        elif resolved is Backend.AUTO:
+            # For AUTO, the offline sub-check already ran above.
+            offline_r = get_provider(Backend.OFFLINE).readiness()
+            health["ollama"] = {
+                "available": offline_r.ready,
+                "detail": offline_r.technical or offline_r.message,
             }
         else:
             health["ollama"] = {

@@ -14,11 +14,17 @@ const TITLES: Record<string, { title: string; subtitle: string }> = {
 }
 
 export default function App() {
-  const [backend, setBackend] = useState<Backend>("offline")
+  const [backend, setBackend] = useState<Backend>("auto")
   const [tab, setTab] = useState("ask")
   const { data: health } = useHealth(backend)
   const backendReady = Boolean(health?.inference.ready)
   const heading = TITLES[tab]
+
+  // Resolved provider for display: for AUTO read what the backend chose.
+  const activeProvider =
+    backend === "auto"
+      ? (health?.inference.active_provider ?? null)
+      : backend
 
   return (
     <div className="flex h-screen bg-base-950">
@@ -32,14 +38,18 @@ export default function App() {
           <span
             className={cn(
               "shrink-0 rounded-full px-3 py-1.5 text-[11px] font-medium ring-1 ring-inset",
-              backend === "offline"
+              activeProvider === "online"
+                ? "bg-violet-500/10 text-violet-300 ring-violet-500/20"
+                : activeProvider === "offline"
                 ? "bg-emerald-500/10 text-emerald-300 ring-emerald-500/20"
-                : "bg-sky-500/10 text-sky-300 ring-sky-500/20",
+                : "bg-base-800/60 text-base-400 ring-white/[0.06]",
             )}
           >
-            {backend === "offline"
+            {activeProvider === "online"
+              ? "☁️ Online — retrieval stays local, answers written in the cloud"
+              : activeProvider === "offline"
               ? "🔒 Offline — every stage runs on this machine"
-              : "☁️ Online — retrieval stays local, answers written in the cloud"}
+              : "⏳ Checking provider…"}
           </span>
         </div>
         <div className="flex-1 overflow-y-auto">

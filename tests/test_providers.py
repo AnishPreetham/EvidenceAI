@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import settings
 from providers import (
+    AutoProvider,
     Backend,
     OllamaProvider,
     OpenAIProvider,
@@ -75,8 +76,9 @@ def test_backend_resolution():
     assert resolve_backend("online") is Backend.ONLINE
     assert resolve_backend("OFFLINE") is Backend.OFFLINE
     assert resolve_backend(Backend.ONLINE) is Backend.ONLINE
-    # An unknown value must fall back safely rather than raise.
-    assert resolve_backend("nonsense") is Backend.OFFLINE
+    assert resolve_backend("auto") is Backend.AUTO
+    # An unknown value must fall back safely to AUTO rather than raise.
+    assert resolve_backend("nonsense") is Backend.AUTO
 
 
 def test_provider_selection_returns_right_class():
@@ -470,3 +472,137 @@ def test_online_provider_error_surfaces_technical_detail_separately(
     detail = last_technical_detail()
     assert "401" in detail
     assert FAKE_KEY not in detail
+
+
+# ---------------------------------------------------- AUTO provider
+
+def test_auto_provider_instantiates():
+    provider = get_provider(Backend.AUTO)
+    assert isinstance(provider, AutoProvider)
+    assert provider.backend is Backend.AUTO
+
+
+def test_auto_uses_online_when_key_present(monkeypatch, with_key, evidence):
+    """AUTO routes to online when the key is configured."""
+    AutoProvider._online_ready = None  # clear cache
+
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["called"] = True
+        return _fake_response({"choices": [{"message": {"content": "answer"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("llm.ollama_available", lambda: (_ for _ in ()).throw(
+        AssertionError("offline must not be used when online is ready")
+    ))
+
+    result = AutoProvider().generate("q", evidence, {"s": "f.pdf"})
+    assert result == "answer"
+    assert captured.get("called")
+
+
+def test_auto_falls_back_to_offline_when_no_key(monkeypatch, without_key, evidence):
+    """AUTO falls back to offline when no API key is configured."""
+    AutoProvider._online_ready = None  # clear cache
+
+    def fake_ollama_available():
+        return True, "Ollama ready"
+
+    def fake_ollama_generate(prompt, image_paths=None):
+        return "offline answer"
+
+    monkeypatch.setattr("llm.ollama_available", fake_ollama_available)
+    monkeypatch.setattr("llm.ollama_generate", fake_ollama_generate)
+
+    result = AutoProvider().generate("q", evidence, {"s": "f.pdf"})
+    assert result == "offline answer"
+
+
+def test_auto_falls_back_on_connectivity_error(monkeypatch, with_key, evidence):
+    """AUTO retries via offline when online fails with a transient error."""
+    AutoProvider._online_ready = None  # clear cache
+
+    call_count = {"online": 0, "offline": 0}
+
+    def fake_urlopen(request, timeout=None):
+        call_count["online"] += 1
+        raise urllib.error.URLError("no route to host")
+
+    def fake_ollama_available():
+        return True, "Ollama ready"
+
+    def fake_ollama_generate(prompt, image_paths=None):
+        call_count["offline"] += 1
+        return "offline fallback answer"
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("llm.ollama_available", fake_ollama_available)
+    monkeypatch.setattr("llm.ollama_generate", fake_ollama_generate)
+
+    result = AutoProvider().generate("q", evidence, {"s": "f.pdf"})
+    assert result == "offline fallback answer"
+    assert call_count["online"] == 1
+    assert call_count["offline"] == 1
+
+
+def test_auto_does_not_fall_back_on_auth_error(monkeypatch, with_key, evidence):
+    """AUTO raises (not falls back) on auth errors -- a config problem."""
+    AutoProvider._online_ready = None  # clear cache
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(401)),
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        AutoProvider().generate("q", evidence, {"s": "f.pdf"})
+    assert "authenticate" in exc_info.value.user_message.lower()
+
+
+def test_auto_readiness_uses_online_when_key_present(monkeypatch, with_key):
+    AutoProvider._online_ready = None
+    r = AutoProvider().readiness()
+    assert r.ready is True
+    assert "online" in r.technical.lower()
+
+
+def test_auto_readiness_falls_back_to_offline(monkeypatch, without_key):
+    AutoProvider._online_ready = None
+
+    monkeypatch.setattr("llm.ollama_available", lambda: (True, "Ollama ready"))
+    r = AutoProvider().readiness()
+    assert r.ready is True
+    assert "offline" in r.technical.lower()
+
+
+def test_auto_readiness_reports_both_unavailable(monkeypatch, without_key):
+    AutoProvider._online_ready = None
+
+    monkeypatch.setattr(
+        "llm.ollama_available",
+        lambda: (False, "OLLAMA_NOT_AVAILABLE: connection refused"),
+    )
+    r = AutoProvider().readiness()
+    assert r.ready is False
+    assert "no ai provider" in r.message.lower()
+
+
+def test_auto_health_includes_per_provider_detail(monkeypatch, with_key):
+    """The health dict for AUTO mode must include online and offline sub-status."""
+    AutoProvider._online_ready = None
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: _fake_response({"choices": [{"message": {"content": "ok"}}]}),
+    )
+    monkeypatch.setattr("llm.ollama_available", lambda: (False, "not running"))
+
+    from rag_pipeline import get_pipeline
+    h = get_pipeline().health(backend=Backend.AUTO)
+
+    assert h["backend"] == "auto"
+    assert "online" in h["inference"]
+    assert "offline" in h["inference"]
+    assert h["inference"]["active_provider"] in ("online", "offline", None)
+    assert isinstance(h["inference"]["fallback"], bool)

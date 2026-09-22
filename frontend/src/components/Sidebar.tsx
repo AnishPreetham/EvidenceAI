@@ -1,4 +1,5 @@
-import { Cpu, Database, FileStack, Layers, MessageSquareText, ScanText, Sparkles, UploadCloud } from "lucide-react"
+import { useState } from "react"
+import { Cpu, Database, FileStack, Layers, MessageSquareText, ScanText, Settings2, Sparkles, UploadCloud } from "lucide-react"
 import { Badge } from "@/components/ui/Badge"
 import { Toggle } from "@/components/ui/Toggle"
 import type { Backend } from "@/lib/types"
@@ -23,6 +24,13 @@ export function Sidebar({
   onTabChange: (t: string) => void
 }) {
   const { data: health, isLoading, isError } = useHealth(backend)
+  const [showDebugOverride, setShowDebugOverride] = useState(false)
+
+  // The provider that is actually serving requests right now.
+  const activeProvider =
+    backend === "auto"
+      ? (health?.inference.active_provider ?? null)
+      : backend
 
   return (
     <aside className="flex w-72 shrink-0 flex-col gap-7 border-r border-white/[0.06] bg-base-900/60 p-5">
@@ -68,35 +76,94 @@ export function Sidebar({
 
       {/* Inference mode ------------------------------------------------ */}
       <section>
-        <h2 className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-base-400">
-          Inference mode
-        </h2>
-        <Toggle
-          options={[{ id: "offline", label: "Offline" }, { id: "online", label: "Online" }]}
-          value={backend}
-          onChange={(id) => onBackendChange(id as Backend)}
-          className="w-full [&>button]:flex-1"
-        />
-        <p className="mt-2 text-[11px] leading-relaxed text-base-400">
-          {backend === "offline"
-            ? "Runs entirely on this machine — nothing leaves your computer."
-            : "Retrieval stays local; the answer is written by a cloud model."}
-        </p>
-
-        <div className="mt-3">
-          {isLoading && <Badge tone="neutral">checking…</Badge>}
-          {isError && <Badge tone="rose">unreachable</Badge>}
-          {health && (
-            <Badge tone={health.inference.ready ? "emerald" : "amber"}>
-              {health.inference.ready ? "● ready" : "● not ready"}
-            </Badge>
-          )}
-          {health && !health.inference.ready && (
-            <p className="mt-2 text-[11px] leading-relaxed text-base-400">
-              {health.inference.message}
-            </p>
-          )}
+        <div className="mb-2.5 flex items-center justify-between">
+          <h2 className="text-[11px] font-semibold uppercase tracking-wider text-base-400">
+            Provider
+          </h2>
+          <button
+            onClick={() => setShowDebugOverride((v) => !v)}
+            title="Debug: override provider"
+            className="text-base-600 hover:text-base-400"
+          >
+            <Settings2 className="h-3.5 w-3.5" />
+          </button>
         </div>
+
+        {/* Auto status display */}
+        {backend === "auto" && (
+          <div className="space-y-2">
+            {isLoading && <Badge tone="neutral">checking…</Badge>}
+            {isError && <Badge tone="rose">unreachable</Badge>}
+            {activeProvider === "online" && (
+              <div>
+                <Badge tone="violet">● Online</Badge>
+                <p className="mt-1.5 text-[11px] leading-relaxed text-base-400">
+                  {health?.inference.fallback
+                    ? `Using online — offline unavailable`
+                    : `Online provider available`}
+                </p>
+              </div>
+            )}
+            {activeProvider === "offline" && (
+              <div>
+                <Badge tone="emerald">● Offline</Badge>
+                <p className="mt-1.5 text-[11px] leading-relaxed text-base-400">
+                  {health?.inference.fallback
+                    ? "Using offline — online unavailable"
+                    : "Offline AI ready"}
+                </p>
+              </div>
+            )}
+            {health && !health.inference.ready && (
+              <div>
+                <Badge tone="rose">● No provider</Badge>
+                <p className="mt-1.5 text-[11px] leading-relaxed text-base-400">
+                  {health.inference.message}
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Non-auto: show direct readiness */}
+        {backend !== "auto" && (
+          <div>
+            {isLoading && <Badge tone="neutral">checking…</Badge>}
+            {isError && <Badge tone="rose">unreachable</Badge>}
+            {health && (
+              <Badge tone={health.inference.ready ? "emerald" : "amber"}>
+                {health.inference.ready ? `● ${backend}` : "● not ready"}
+              </Badge>
+            )}
+            {health && !health.inference.ready && (
+              <p className="mt-2 text-[11px] leading-relaxed text-base-400">
+                {health.inference.message}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Debug override -------------------------------------------- */}
+        {showDebugOverride && (
+          <div className="mt-3 rounded-[10px] border border-white/[0.07] bg-black/20 p-2.5">
+            <p className="mb-2 text-[10px] uppercase tracking-wider text-base-500">
+              Override
+            </p>
+            <Toggle
+              options={[
+                { id: "auto", label: "Auto" },
+                { id: "offline", label: "Offline" },
+                { id: "online", label: "Online" },
+              ]}
+              value={backend}
+              onChange={(id) => onBackendChange(id as Backend)}
+              className="w-full [&>button]:flex-1"
+            />
+            <p className="mt-2 text-[10px] leading-relaxed text-base-500">
+              Auto selects online when available, offline otherwise.
+            </p>
+          </div>
+        )}
       </section>
 
       {/* Runtime -------------------------------------------------------- */}

@@ -14,7 +14,7 @@ export type InferenceMode = "local" | "local_vision"
 
 export type QueryModality = "text" | "image" | "audio" | "document"
 
-export type Backend = "offline" | "online"
+export type Backend = "offline" | "online" | "auto"
 
 export type ErrorCode =
   | "OLLAMA_NOT_AVAILABLE" | "QWEN_MODEL_NOT_AVAILABLE" | "OCR_NOT_AVAILABLE"
@@ -136,6 +136,18 @@ export interface InferenceStatus {
   message: string
   technical: string
   can_autostart?: boolean
+  // AUTO mode only
+  active_provider?: "online" | "offline" | null
+  fallback?: boolean
+  fallback_reason?: string | null
+  online?: { ready: boolean; message: string; model: string; code: string | null }
+  offline?: {
+    ready: boolean
+    message: string
+    model: string
+    code: string | null
+    can_autostart?: boolean
+  }
 }
 
 export interface HealthResponse {
